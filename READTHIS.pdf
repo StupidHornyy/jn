@@ -1,0 +1,68 @@
+# READTHIS — jn Technical Specification & Shell Wrappers
+
+This document outlines the low-level architecture, binary mutilation mechanics, and parent-shell configuration wrappers for the 280-byte `jn` utility.
+
+---
+
+## 1. Low-Level Architecture Blueprint
+
+### 0-Byte Memory Footprint
+Standard binaries reserve space in the compiled file for uninitialized global variables via the `.bss` section or initialized variables via `.data`. To drop the file size below the standard page alignment limits, `jn` operates completely stateless. 
+* It allocates memory dynamically on the active CPU stack using `sub rsp, 144` to house the raw `sys_stat` structure.
+* Once validation completes, the stack pointer is restored via `add rsp, 144` before returning control to the kernel via `sys_exit` (syscall 60).
+
+### Section Header Table (SHT) Slaughterhouse
+Standard tools like `strip` refuse to truncate the Section Header Table to maintain compatibility with debuggers (`readelf`, `gdb`). However, the Linux Kernel loader completely ignores the SHT at runtime; it only reads the Program Header Table (`PT_LOAD` segments) to map code into memory pages via the MMU.
+* The `strip_shdrs.py` script performing direct binary slicing zeros out `e_shoff` (offset 40), `e_shnum` (offset 60), and `e_shstrndx` (offset 62) inside the 64-byte ELF Header.
+* It then truncates the file trailing bytes right at the `shoff` boundary, discarding all useless section description strings.
+
+### The RWX Linked Segment
+Compiling with `ld -N` merges code (`.text`) and data into a single unified page segment. This flags the binary with RWX (Readable, Writable, Executable) attributes. While modern compilers trigger security alerts (`warning: jn has a LOAD segment with RWX permissions`), it is safe here because the utility is stateless, contains no dynamic lookups, and runs entirely on registers and the stack.
+
+---
+
+## 2. Target Shell Integration Wrappers
+
+Because a compiled child process can never change the current working directory (`chdir`) environment of its parent process natively due to kernel sandbox boundaries, the binary evaluates structural safety in hardware RAM and prints the target destination to `stdout` for the parent process to ingest.
+
+### Plan 9 rc (~/.rcrc)
+```rc
+fn cd {
+    if { ~ \$#* 0 } {
+        target = `{/home/onyx/jn/jn}
+        if { ~ $status 0 } { builtin cd $target }
+    } else {
+        target = `{/home/onyx/jn/jn \$* }
+        if { ~ status 0 builtin cd target } else { echo 'jn: bad path' }
+    }
+}
+```
+
+### Extensible Shell es (~/.esrc)
+```es
+fn-cd = {
+    if { ~ \$#* 0 } {
+        local (target = `{/home/onyx/jn/jn}) {
+            if { ~ $status 0 } { builtin cd $target }
+        }
+    } {
+        local (target = `{/home/onyx/jn/jn \$*}) {
+            if { ~ status 0 builtin cd target } { echo 'jn: bad path' }
+        }
+    }
+}
+```
+
+### Strict POSIX / Korn / Toybox (mksh, yash, ash)
+```sh
+cd() {
+    _target=(/home/onyx/jn/jn "@")
+    if [ \(? -eq 0 ] && [ -n "\)_target" ]; then
+        command cd "\$_target"
+    else
+        echo "jn: bad path" >&2
+        return 1
+    fi
+}
+```
+
